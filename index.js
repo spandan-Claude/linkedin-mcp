@@ -3,13 +3,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
-// ── Credentials (set these in Render environment variables) ──────────────────
-const ACCESS_TOKEN = process.env.LINKEDIN_ACCESS_TOKEN;
-const ACCOUNT_URN  = process.env.LINKEDIN_ACCOUNT_URN; // urn:li:sponsoredAccount:509056742
+// ── Credentials ──────────────────────────────────────────────────────────────
+const LINKEDIN_ACCESS_TOKEN = process.env.LINKEDIN_ACCESS_TOKEN;
+const ACCOUNT_URN           = process.env.LINKEDIN_ACCOUNT_URN;
+const MCP_AUTH_TOKEN        = process.env.MCP_AUTH_TOKEN; // Claude uses this to connect
 
 const BASE_URL = "https://api.linkedin.com/rest";
 const HEADERS  = {
-  "Authorization":             `Bearer ${ACCESS_TOKEN}`,
+  "Authorization":             `Bearer ${LINKEDIN_ACCESS_TOKEN}`,
   "LinkedIn-Version":          "202601",
   "X-Restli-Protocol-Version": "2.0.0",
   "Content-Type":              "application/json"
@@ -50,7 +51,6 @@ server.tool(
   async ({ pivot, timeGranularity, dateStart, dateEnd }) => {
     const [startYear, startMonth, startDay] = dateStart.split("-");
     const [endYear,   endMonth,   endDay  ] = dateEnd.split("-");
-
     const params = new URLSearchParams({
       q:                       "analytics",
       accounts:                `List(${ACCOUNT_URN})`,
@@ -64,7 +64,6 @@ server.tool(
       "dateRange.end.day":     endDay,
       fields:                  "impressions,clicks,costInLocalCurrency,dateRange,pivotValues"
     });
-
     const result = await linkedInGet(`/adAnalytics?${params}`);
     return { content: [{ type: "text", text: result }] };
   }
@@ -111,12 +110,11 @@ server.tool(
     conversionValue: z.number().optional().describe("Revenue value in INR"),
   },
   async ({ conversionId, eventHappenedAt, userEmail, conversionValue }) => {
-    const encoder    = new TextEncoder();
-    const emailBytes = encoder.encode(userEmail.toLowerCase().trim());
-    const hashBuffer = await crypto.subtle.digest("SHA-256", emailBytes);
-    const hashArray  = Array.from(new Uint8Array(hashBuffer));
+    const encoder     = new TextEncoder();
+    const emailBytes  = encoder.encode(userEmail.toLowerCase().trim());
+    const hashBuffer  = await crypto.subtle.digest("SHA-256", emailBytes);
+    const hashArray   = Array.from(new Uint8Array(hashBuffer));
     const hashedEmail = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
-
     const body = {
       conversion:           `urn:li:conversion:${conversionId}`,
       conversionHappenedAt: parseInt(eventHappenedAt),
@@ -125,36 +123,83 @@ server.tool(
         conversionValue: { amount: String(conversionValue), currencyCode: "INR" }
       })
     };
-
     const result = await linkedInPost("/conversionEvents", body);
     return { content: [{ type: "text", text: result }] };
   }
 );
 
-// ── Express + SSE Transport (required for cloud hosting) ─────────────────────
+// ── Express App ───────────────────────────────────────────────────────────────
 const app = express();
 const transports = {};
 
+// OAuth metadata endpoint — Claude checks this first
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const base = `https://${req.headers.host}`;
+  res.json({
+    issuer:                 base,
+    authorization_endpoint: `${base}/authorize`,
+    token_endpoint:         `${base}/token`,
+    response_types_supported: ["code"],
+    grant_types_supported:    ["authorization_code"]
+  });
+});
+
+// Authorization endpoint — shows a simple approval page
+app.get("/authorize", (req, res) => {
+  const { redirect_uri, state, client_id } = req.query;
+  res.send(`
+    <html>
+      <body style="font-family:sans-serif;max-width:400px;margin:80px auto;text-align:center;">
+        <h2>LinkedIn MCP Server</h2>
+        <p>Allow Claude to access your LinkedIn Ads data?</p>
+        <form method="POST" action="/approve">
+          <input type="hidden" name="redirect_uri" value="${redirect_uri}">
+          <input type="hidden" name="state" value="${state}">
+          <button type="submit" 
+            style="background:#0077B5;color:white;padding:12px 28px;border:none;border-radius:6px;font-size:16px;cursor:pointer;">
+            Allow Access
+          </button>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+// Approve — redirects back to Claude with an auth code
+app.post("/approve", express.urlencoded({ extended: true }), (req, res) => {
+  const { redirect_uri, state } = req.body;
+  const code = "linkedin-mcp-auth-code";
+  res.redirect(`${redirect_uri}?code=${code}&state=${state}`);
+});
+
+// Token endpoint — exchanges code for access token
+app.post("/token", express.urlencoded({ extended: true }), express.json(), (req, res) => {
+  res.json({
+    access_token: MCP_AUTH_TOKEN,
+    token_type:   "Bearer",
+    expires_in:   999999
+  });
+});
+
+// SSE endpoint — Claude connects here
 app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
   await server.connect(transport);
-
   res.on("close", () => {
     delete transports[transport.sessionId];
   });
 });
 
+// Messages endpoint — Claude sends tool calls here
 app.post("/messages", express.json(), async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
-  if (!transport) {
-    return res.status(404).json({ error: "Session not found" });
-  }
+  if (!transport) return res.status(404).json({ error: "Session not found" });
   await transport.handlePostMessage(req, res);
 });
 
-// Health check endpoint (used by UptimeRobot to prevent sleep)
+// Health check — keeps server awake
 app.get("/health", (req, res) => {
   res.json({ status: "ok", server: "linkedin-mcp" });
 });
