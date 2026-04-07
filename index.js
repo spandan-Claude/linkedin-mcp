@@ -6,7 +6,7 @@ import { z } from "zod";
 // ── Credentials ──────────────────────────────────────────────────────────────
 const LINKEDIN_ACCESS_TOKEN = process.env.LINKEDIN_ACCESS_TOKEN;
 const ACCOUNT_URN           = process.env.LINKEDIN_ACCOUNT_URN;
-const MCP_AUTH_TOKEN        = process.env.MCP_AUTH_TOKEN; // Claude uses this to connect
+const MCP_AUTH_TOKEN        = process.env.MCP_AUTH_TOKEN;
 
 const BASE_URL = "https://api.linkedin.com/rest";
 const HEADERS  = {
@@ -132,21 +132,39 @@ server.tool(
 const app = express();
 const transports = {};
 
-// OAuth metadata endpoint — Claude checks this first
+// ✅ ROOT route — fixes "Cannot GET /"
+app.get("/", (req, res) => {
+  res.json({
+    name:    "LinkedIn Ads MCP Server",
+    version: "1.0.0",
+    status:  "running",
+    endpoints: {
+      sse:    "/sse",
+      health: "/health"
+    }
+  });
+});
+
+// ✅ Health check — keeps Render free tier awake (ping this every 5 min)
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", server: "linkedin-mcp", timestamp: new Date().toISOString() });
+});
+
+// ✅ OAuth metadata — Claude checks this to discover auth endpoints
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   const base = `https://${req.headers.host}`;
   res.json({
-    issuer:                 base,
-    authorization_endpoint: `${base}/authorize`,
-    token_endpoint:         `${base}/token`,
+    issuer:                   base,
+    authorization_endpoint:   `${base}/authorize`,
+    token_endpoint:           `${base}/token`,
     response_types_supported: ["code"],
     grant_types_supported:    ["authorization_code"]
   });
 });
 
-// Authorization endpoint — shows a simple approval page
+// ✅ Authorization page — shown to user to approve Claude's access
 app.get("/authorize", (req, res) => {
-  const { redirect_uri, state, client_id } = req.query;
+  const { redirect_uri, state } = req.query;
   res.send(`
     <html>
       <body style="font-family:sans-serif;max-width:400px;margin:80px auto;text-align:center;">
@@ -155,7 +173,7 @@ app.get("/authorize", (req, res) => {
         <form method="POST" action="/approve">
           <input type="hidden" name="redirect_uri" value="${redirect_uri}">
           <input type="hidden" name="state" value="${state}">
-          <button type="submit" 
+          <button type="submit"
             style="background:#0077B5;color:white;padding:12px 28px;border:none;border-radius:6px;font-size:16px;cursor:pointer;">
             Allow Access
           </button>
@@ -165,14 +183,14 @@ app.get("/authorize", (req, res) => {
   `);
 });
 
-// Approve — redirects back to Claude with an auth code
+// ✅ Approve — redirects back to Claude with auth code
 app.post("/approve", express.urlencoded({ extended: true }), (req, res) => {
   const { redirect_uri, state } = req.body;
-  const code = "linkedin-mcp-auth-code";
-  res.redirect(`${redirect_uri}?code=${code}&state=${state}`);
+  const code = Buffer.from(`auth-${Date.now()}`).toString("base64");
+  res.redirect(`${redirect_uri}?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`);
 });
 
-// Token endpoint — exchanges code for access token
+// ✅ Token endpoint — exchanges code for the MCP auth token
 app.post("/token", express.urlencoded({ extended: true }), express.json(), (req, res) => {
   res.json({
     access_token: MCP_AUTH_TOKEN,
@@ -181,27 +199,31 @@ app.post("/token", express.urlencoded({ extended: true }), express.json(), (req,
   });
 });
 
-// SSE endpoint — Claude connects here
+// ✅ SSE endpoint — Claude connects here to establish MCP session
 app.get("/sse", async (req, res) => {
+  // Optional: verify bearer token if MCP_AUTH_TOKEN is set
+  if (MCP_AUTH_TOKEN) {
+    const auth = req.headers.authorization || "";
+    const token = auth.replace("Bearer ", "").trim();
+    if (token !== MCP_AUTH_TOKEN) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+  }
+
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
-  await server.connect(transport);
   res.on("close", () => {
     delete transports[transport.sessionId];
   });
+  await server.connect(transport);
 });
 
-// Messages endpoint — Claude sends tool calls here
+// ✅ Messages endpoint — Claude sends tool calls here
 app.post("/messages", express.json(), async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
   if (!transport) return res.status(404).json({ error: "Session not found" });
   await transport.handlePostMessage(req, res);
-});
-
-// Health check — keeps server awake
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", server: "linkedin-mcp" });
 });
 
 const PORT = process.env.PORT || 3000;
